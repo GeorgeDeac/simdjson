@@ -59,17 +59,20 @@ class json_structural_scanner {
 public:
   // Whether the first character of the next iteration is escaped.
   uint64_t prev_escaped = 0ULL;
-  // Whether the last iteration was still inside a string (all 1's = true, all 0's = false).
+  // Whether we were still inside a string during the last iteration (all 1's = true, all 0's = false).
   uint64_t prev_in_string = 0ULL;
-  // Whether the last character of the previous iteration is a primitive value character
-  // (anything except whitespace, braces, comma or colon).
+  // Overflow for the value series calculation we use to validate structure
+  uint64_t prev_start_value = 0ULL;
+  // Whether the last byte we primitive (i.e. can be followed by primitive or quote)
   uint64_t prev_primitive = 0ULL;
+  // Whether the last thing we saw was a separator (i.e. , and spaces)
+  uint64_t prev_separator = 0ULL;
   // Mask of structural characters from the last iteration.
   // Kept around for performance reasons, so we can call flatten_bits to soak up some unused
   // CPU capacity while the next iteration is busy with an expensive clmul in compute_quote_mask.
   uint64_t prev_structurals = 0;
-  // Errors with unescaped characters in strings (ASCII codepoints < 0x20)
-  uint64_t unescaped_chars_error = 0;
+  // Whether it has errors of any sort
+  uint64_t has_error = 0;
   bit_indexer structural_indexes;
 
   json_structural_scanner(uint32_t *_structural_indexes) : structural_indexes{_structural_indexes} {}
@@ -123,44 +126,10 @@ public:
   really_inline void scan(const uint8_t *buf, const size_t len, utf8_checker &utf8_checker);
 };
 
-// return a bitvector indicating where we have characters that end an odd-length
-// sequence of backslashes (and thus change the behavior of the next character
-// to follow). A even-length sequence of backslashes, and, for that matter, the
-// largest even-length prefix of our odd-length sequence of backslashes, simply
-// modify the behavior of the backslashes themselves.
-// We also update the prev_iter_ends_odd_backslash reference parameter to
-// indicate whether we end an iteration on an odd-length sequence of
-// backslashes, which modifies our subsequent search for odd-length
-// sequences of backslashes in an obvious way.
-really_inline uint64_t follows_odd_sequence_of(const uint64_t match, uint64_t &overflow) {
-  const uint64_t even_bits = 0x5555555555555555ULL;
-  const uint64_t odd_bits = ~even_bits;
-  uint64_t start_edges = match & ~(match << 1);
-  /* flip lowest if we have an odd-length run at the end of the prior
-  * iteration */
-  uint64_t even_start_mask = even_bits ^ overflow;
-  uint64_t even_starts = start_edges & even_start_mask;
-  uint64_t odd_starts = start_edges & ~even_start_mask;
-  uint64_t even_carries = match + even_starts;
-
-  uint64_t odd_carries;
-  /* must record the carry-out of our odd-carries out of bit 63; this
-  * indicates whether the sense of any edge going to the next iteration
-  * should be flipped */
-  bool new_overflow = add_overflow(match, odd_starts, &odd_carries);
-
-  odd_carries |= overflow; /* push in bit zero as a
-                              * potential end if we had an
-                              * odd-numbered run at the
-                              * end of the previous
-                              * iteration */
-  overflow = new_overflow ? 0x1ULL : 0x0ULL;
-  uint64_t even_carry_ends = even_carries & ~match;
-  uint64_t odd_carry_ends = odd_carries & ~match;
-  uint64_t even_start_odd_end = even_carry_ends & odd_bits;
-  uint64_t odd_start_even_end = odd_carry_ends & even_bits;
-  uint64_t odd_ends = even_start_odd_end | odd_start_even_end;
-  return odd_ends;
+really_inline uint64_t find_series(const uint64_t start, const uint64_t end, uint64_t &overflow) {
+  uint64_t result;
+  overflow = sub_overflow(end, start + overflow, &result);
+  return result;
 }
 
 //
@@ -176,16 +145,31 @@ really_inline uint64_t follows(const uint64_t match, uint64_t &overflow) {
   return result;
 }
 
+
+really_inline uint64_t follows_every_other(uint64_t match, uint64_t &overflow) {
+  const uint64_t odd_bits = 0xAAAAAAAAAAAAAAAAULL;
+
+  // Bring in the overflow
+  uint64_t follows_match = match << 1 | overflow;
+
+  // Get sequences starting on even bits by clearing out the odd series using +
+  uint64_t odd_sequence_starts = match & odd_bits & ~follows_match;
+  uint64_t sequences_starting_on_even_bits;
+  overflow = add_overflow(odd_sequence_starts, follows_match, &sequences_starting_on_even_bits);
+
+  // set even bits to even_bits, and flip odd bits using ^
+  return (odd_bits ^ sequences_starting_on_even_bits) & follows_match;
+}
+
 //
 // Check if the current character follows a matching character, with possible "filler" between.
 // For example, this checks for empty curly braces, e.g. 
 //
-//     in.eq('}') & follows(in.eq('['), in.eq(' '), prev_empty_array) // { <whitespace>* }
+//     in.eq('}') & follows(in.eq('{'), in.eq(' '), prev_open_curly) // { <whitespace>* }
 //
-really_inline uint64_t follows(const uint64_t match, const uint64_t filler, uint64_t &overflow) {
-  uint64_t follows_match = follows(match, overflow);
+really_inline uint64_t follows_series(const uint64_t match, const uint64_t filler, uint64_t &overflow) {
   uint64_t result;
-  overflow |= add_overflow(follows_match, filler, &result);
+  overflow = add_overflow(match, match|filler, &result);
   return result;
 }
 
@@ -193,9 +177,14 @@ really_inline ErrorValues json_structural_scanner::detect_errors_on_eof(bool str
   if ((prev_in_string) and (not streaming)) {
     return UNCLOSED_STRING;
   }
-  if (unescaped_chars_error) {
-    return UNESCAPED_CHARS;
+  if (prev_separator) {
+    return TAPE_ERROR; // comma at the end is invalid
   }
+  if (has_error) {
+    return UNESCAPED_CHARS; // TODO also out of order JSON
+  }
+  // TODO validate that it either has one value, or starts with OPEN
+  // (maybe that gets validated in the collection validator ...)
   return SUCCESS;
 }
 
@@ -207,49 +196,118 @@ really_inline ErrorValues json_structural_scanner::detect_errors_on_eof(bool str
 //
 // Backslash sequences outside of quotes will be detected in stage 2.
 //
-really_inline uint64_t json_structural_scanner::find_strings(const simd::simd8x64<uint8_t> in) {
+really_inline uint64_t json_structural_scanner::find_strings(const simd::simd8x64<uint8_t> in, uint64_t quote) {
   const uint64_t backslash = in.eq('\\');
-  const uint64_t escaped = follows_odd_sequence_of(backslash, prev_escaped);
-  const uint64_t quote = in.eq('"') & ~escaped;
+  const uint64_t escaped = follows_every_other(backslash, prev_escaped) << 1;
+  const uint64_t real_quote = quote & ~escaped;
   // prefix_xor flips on bits inside the string (and flips off the end quote).
-  const uint64_t in_string = prefix_xor(quote) ^ prev_in_string;
+  const uint64_t in_string = prefix_xor(real_quote) ^ prev_in_string;
   /* right shift of a signed value expected to be well-defined and standard
   * compliant as of C++20,
   * John Regher from Utah U. says this is fine code */
   prev_in_string = static_cast<uint64_t>(static_cast<int64_t>(in_string) >> 63);
   // Use ^ to turn the beginning quote off, and the end quote on.
-  return in_string ^ quote;
+  return in_string ^ real_quote;
 }
 
 //
-// Determine which characters are *structural*:
-// - braces: [] and {}
-// - the start of primitives (123, true, false, null)
-// - the start of invalid non-whitespace (+, &, ture, UTF-8)
+// Validate the sequence of expressions in the JSON:
 //
-// Also detects value sequence errors:
-// - two values with no separator between ("hello" "world")
-// - separators with no values ([1,] [1,,]and [,2])
-//
-// This method will find all of the above whether it is in a string or not.
+// Open* Prim|Close Close* Separator ...
 //
 // To reduce dependency on the expensive "what is in a string" computation, this method treats the
 // contents of a string the same as content outside. Errors and structurals inside the string or on
 // the trailing quote will need to be removed later when the correct string information is known.
 //
-really_inline uint64_t json_structural_scanner::find_potential_structurals(const simd::simd8x64<uint8_t> in) {
-  // These use SIMD so let's kick them off before running the regular 64-bit stuff ...
-  uint64_t whitespace, op;
-  find_whitespace_and_operators(in, whitespace, op);
+really_inline uint64_t json_structural_scanner::find_potential_structurals(const simd8x64<uint8_t> in, uint64_t quote, uint64_t &invalid_expression) {
+  //
+  // Classify the characters first ...
+  //
+  // 0x20 and under is whitespace. We're including plenty of invalid values here, but that's OK; we'll be validating those
+  // separately. As long as this *doesn't* include operators or valid value characters, we're good.
+  uint64_t space = (in <= 0x20).to_bitmask();
+  simd8<uint8_t> to_curly = in | ('{' - '[');
+  uint64_t open = (to_curly == '{').to_bitmask();
+  uint64_t close = (to_curly == '}').to_bitmask();
+  uint64_t curly = (open | close) & (in >= '{');
+  uint64_t colon = (in == ':').to_bitmask();
+  uint64_t separator = colon | (in == ',').to_bitmask();
 
-  // Detect the start of a run of primitive characters. Includes numbers, booleans, and strings (").
-  // Everything except whitespace, braces, colon and comma.
-  const uint64_t primitive = ~(op | whitespace);
-  const uint64_t follows_primitive = follows(primitive, prev_primitive);
-  const uint64_t start_primitive = primitive & ~follows_primitive;
+  //
+  // Validate the operators: Open Prim|Close Close* Separator ...
+  //
+  // Where Prim is any non-whitespace, non-operator.
+  //
+  // We subtract Separator - (Prim|Close) to show the following series:
+  //
+  //        <Open>             |            <Value><Close>             | <Separator>
+  // (Separator | Open|Space)* | Prim|Close (Prim|Close | Open|Space)* | Separator
+  //     ERR           0       |    1            0       ERR    1      |    0
+  //
+  uint64_t primitive = ~(separator|open|space|close);
+  uint64_t start_value = find_series(primitive|close, separator, start_value_overflow);
 
-  // Return final structurals
-  return op | start_primitive;
+  //
+  // Validate: all of these examples are invalid *unless inside a string* (which we don't know yet):
+  //
+  // | Category  | Example | Detection                                  |
+  // |-----------|---------|--------------------------------------------|
+  // | Open      | `1 {`   | Open = 1                                   |
+  // |           | `} {`   |                                            |
+  // |-----------|---------|--------------------------------------------|
+  // | Separator | `, ,`   | Separator = 1                              |
+  // |           | `{ ,`   |                                            |
+  // |-----------|---------|--------------------------------------------|
+  // | Close     | `, }`   | Close = 1 MUST be empty:                   |
+  // |           |         | - invalid=Separator Space* Close           |
+  // |           |         | - valid=Open Space* Close                  |
+  // |           |         | Detected later, in collection validation   |
+  // |-----------|---------|--------------------------------------------|
+  // | Primitive | `1 1`   | Primitive = 0 preceded by Space|Close      |
+  // |           | `1}1`   |                                            |
+  // |           | `}1`    |                                            |
+  // |-----------|---------|--------------------------------------------|
+  // | Quote     | `1"`    | Quote = 0 (any " after the first *must*    |
+  // |           | `1"1`   | be in/end of a string).                    |
+  // |           | `"""`   |                                            |
+  // |           |         | Because of this, the tail quotes in `""`,  |
+  // |           |         | `" "`, `\"` and `"\""` will end up valid   |
+  // |           |         | (`\"` can occur in a document like         |
+  // |           |         | `[1,2,"3,\""]` because separators can      |
+  // |           |         | occur inside strings).                     |
+  // |-----------|---------|--------------------------------------------|
+  // | Space     |         | Whitespace is always cool.                 |
+  // |-----------|---------|--------------------------------------------|
+  //
+
+  // Separator/Open = 1: `1 {`, `} {`, `, ,`, `{ ,`
+  invalid_expression = (separator|open) & start_value;
+  // Quote = 0: `1"` `1"1` `"""`
+  invalid_expression |= quote & ~start_value;
+
+  // Value: Error on `1 1`, `1}1`, `""1`, `}1`
+  // All primitive chars except the first must be preceded by a non-quote primitive
+  // (first " is OK)
+  uint64_t tail_primitive = primitive & ~start_value;
+  uint64_t tail_quote = quote & ~start_value;
+  invalid_expression |= tail_primitive & follows(primitive & ~tail_quote, prev_primitive);
+
+  // Close: Error on `, }`
+  invalid_expression |= close & follows(separator, space, prev_separator);
+
+  // NOTE: we have not attempted to validate individual characters yet: space and value
+  // include a lot of invalid characters. Still, at *this* point we can at least get rid
+  // of commas ...
+  //
+  // NOTE: at this point *only* quote&start_value can be the beginning of a string.
+  // It's also possible it will be the end of a string, if the previous string
+  // contained a separator. Finally, the only other thing that can possibly be an
+  // end quote is the *last* primitive. Nothing in between. (We've already determined
+  // this from valid/invalid expressions.) Backslashes only ever need checking on
+  // the last quote, therefore, which will only ever happen if the string contains
+  // both an end quote *and* a separator.
+  // We could almost certainly forego clmul now!
+  return start_value | open | close | colon;
 }
 
 //
@@ -285,10 +343,14 @@ really_inline void json_structural_scanner::scan_step<128>(const uint8_t *buf, c
   // This will include false structurals that are *inside* strings--we'll filter strings out
   // before we return.
   //
+  uint64_t quote_1 = in.eq('"');
   uint64_t string_1 = this->find_strings(in_1);
-  uint64_t structurals_1 = this->find_potential_structurals(in_1);
+  uint64_t invalid_expression_1;
+  uint64_t structurals_1 = this->find_potential_structurals(in_1, quote_1, invalid_expression_1);
+  uint64_t quote_2 = in.eq('"');
+  uint64_t invalid_expression_2;
   uint64_t string_2 = this->find_strings(in_2);
-  uint64_t structurals_2 = this->find_potential_structurals(in_2);
+  uint64_t structurals_2 = this->find_potential_structurals(in_2, quote_2, invalid_expression_2);
 
   //
   // Do miscellaneous work while the processor is busy calculating strings and structurals.
@@ -299,13 +361,15 @@ really_inline void json_structural_scanner::scan_step<128>(const uint8_t *buf, c
   utf8_checker.check_next_input(in_1);
   this->structural_indexes.write_indexes(idx-64, this->prev_structurals); // Output *last* iteration's structurals to ParsedJson
   this->prev_structurals = structurals_1 & ~string_1;
-  this->unescaped_chars_error |= unescaped_1 & string_1;
+  this->has_error |= invalid_expression_1 & ~string_1;
+  this->has_error |= unescaped_1 & string_1;
 
   uint64_t unescaped_2 = in_2.lteq(0x1F);
   utf8_checker.check_next_input(in_2);
   this->structural_indexes.write_indexes(idx, this->prev_structurals); // Output *last* iteration's structurals to ParsedJson
   this->prev_structurals = structurals_2 & ~string_2;
-  this->unescaped_chars_error |= unescaped_2 & string_2;
+  this->has_error |= invalid_expression_2 & ~string_2;
+  this->has_error |= unescaped_2 & string_2;
 }
 
 //
